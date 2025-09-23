@@ -2,19 +2,22 @@
 """
 Run the BB84 QKD procedure on an IonQ QPU via Qiskit, with Golay error correction.
 
+What this script does:
 - Reads IonQ API key from environment or .env (gitignored).
-- Builds a single Qiskit circuit with NUMBER_OF_QUBITS qubits following Alice's random
-  bits and bases, and measures in Bob's random bases.
-- Submits to the selected IonQ backend (default: ionq_qpu.aria-1) with 1 shot.
-- Applies Golay(24,12) error correction to reconcile to Alice's raw key (12 sifted bits).
+- Randomly chooses Alice's bits and bases, and Bob's measurement bases.
+- Builds a Qiskit circuit to encode Alice's qubits and measure in Bob's bases.
+- Submits the circuit to the selected IonQ backend (default: ionq_qpu.aria-1) with 1 shot.
+- Repeats rounds until the sifted key length reaches the target (default: 12 bits).
+- Applies Golay(24,12) error correction to reconcile Bob's key with Alice's.
 
-WARNING: Submitting to real hardware may take time due to queueing.
+WARNING: Submitting to real hardware may take time due to queueing and may incur cost.
 
 Usage:
-    .venv/bin/python qiskit_bb84.py --backend ionq_qpu.aria-1 --qubits 12 --bit-flip 0.15
+    .venv/bin/python qiskit_bb84.py --backend ionq_qpu.aria-1 --qubits 12 --sifted 12
 
-Note: Real hardware noise is physical and not the synthetic bit-flip used in the Braket demo.
-The --bit-flip option is ignored on hardware and kept only for parity with the notebook signature.
+Note:
+- Real hardware noise is physical and not the synthetic bit-flip used in the Braket demo.
+- The --bit-flip option is ignored on hardware and kept only for parity with the notebook signature.
 """
 import argparse
 import base64
@@ -61,8 +64,14 @@ except Exception as e:
 
 
 def initialize_protocol(num_qubits: int):
-    """Mimic AWS utils.initialize_protocol: random bases and states.
-    Returns (encoding_basis_A, states_A, measurement_basis_B) as arrays of 0/1 ints.
+    """Randomly initialize BB84 choices for one round.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray, np.ndarray]
+        encoding_basis_A: Alice's basis choices (0=Z, 1=X) for each qubit
+        states_A:         Alice's raw bits (0/1) to encode
+        measurement_basis_B: Bob's measurement bases (0=Z, 1=X) for each qubit
     """
     encoding_basis_A = np.random.randint(0, 2, size=num_qubits)
     states_A = np.random.randint(0, 2, size=num_qubits)
@@ -71,7 +80,14 @@ def initialize_protocol(num_qubits: int):
 
 
 def build_bb84_circuit(states_A, encoding_basis_A, measurement_basis_B):
-    """Build a Qiskit circuit that encodes Alice's bits/bases and measures in Bob's bases."""
+    """Build a Qiskit circuit that implements one BB84 round.
+
+    Steps per qubit i:
+    - Alice prepares |0> or |1> depending on states_A[i].
+    - If Alice's basis is X (encoding_basis_A[i] == 1), she applies H to rotate to X-basis.
+    - Bob measures in his chosen basis: if measurement_basis_B[i] == 1, apply H then measure (X-basis measurement).
+    - Measurement result is stored in the corresponding classical bit.
+    """
     n = len(states_A)
     qc = QuantumCircuit(n, n)
 
@@ -92,20 +108,38 @@ def build_bb84_circuit(states_A, encoding_basis_A, measurement_basis_B):
 
 
 def filter_qubits(bits, basis_A, basis_B):
-    """Keep only positions where Alice and Bob used the same basis."""
+    """Sift the key by keeping only positions where bases matched.
+
+    Parameters
+    ----------
+    bits : sequence[int]
+        Bit values (Alice's sent bits or Bob's measured bits) for the round.
+    basis_A, basis_B : np.ndarray
+        Basis choices (0=Z, 1=X) used by Alice and Bob.
+    """
     keep = (basis_A == basis_B)
     return np.array([bits[i] for i in range(len(bits)) if keep[i]])
 
 
 def array_to_string(arr):
+    """Convert an array of 0/1 values to a compact string like '0101'."""
     return "".join(str(int(x)) for x in arr)
 
 
 def run(backend_name: str, num_qubits: int, target_sifted_bits: int):
-    # Random protocol choices
+    """Execute BB84 on the specified IonQ backend until target sifted bits are collected.
+
+    This function performs:
+    1) Random selection of Alice/Bob bases and Alice's bits.
+    2) Circuit construction and submission to the backend with one shot.
+    3) Sifting to keep outcomes where bases match.
+    4) Repeats the above until target_sifted_bits are accumulated.
+    5) Applies Golay(24,12) error correction to reconcile the keys.
+    """
+    # 1) Random protocol choices for the first round
     encoding_basis_A, states_A, measurement_basis_B = initialize_protocol(num_qubits)
 
-    # Build and submit circuit
+    # 2) Build and submit circuit for one shot
     qc = build_bb84_circuit(states_A, encoding_basis_A, measurement_basis_B)
 
     # IonQ provider from env
@@ -119,6 +153,7 @@ def run(backend_name: str, num_qubits: int, target_sifted_bits: int):
     provider = IonQProvider(api_key)
     backend = provider.get_backend(backend_name)
 
+    # IonQ may define a restricted gate set; transpile maps to supported ops
     tqc = transpile(qc, backend)
     try:
         job = backend.run(tqc, shots=1)
@@ -150,12 +185,12 @@ def run(backend_name: str, num_qubits: int, target_sifted_bits: int):
     bitstring = next(iter(counts.keys()))
     measured_bits = [int(b) for b in bitstring[::-1]]  # reverse to align q0->c0
 
-    # Sifting
+    # 3) Sifting: keep only positions where bases matched
     alice_raw_key = filter_qubits(states_A, encoding_basis_A, measurement_basis_B)
     bob_raw_key = filter_qubits(measured_bits, encoding_basis_A, measurement_basis_B)
 
-    # We may need multiple rounds to get 12 sifted bits. Loop until enough.
-    # For simplicity, repeat whole protocol if insufficient bits.
+    # 4) Accumulate more rounds until we have the target sifted key length
+    #    (Each round is 1 shot of num_qubits; expected ~50% match rate.)
     while len(alice_raw_key) < target_sifted_bits:
         encoding_basis_A, states_A, measurement_basis_B = initialize_protocol(num_qubits)
         qc = build_bb84_circuit(states_A, encoding_basis_A, measurement_basis_B)
@@ -191,7 +226,7 @@ def run(backend_name: str, num_qubits: int, target_sifted_bits: int):
     print(f"Alice raw key (12): {alice_raw_key.astype(int)}")
     print(f"Bob raw key (12):    {bob_raw_key.astype(int)}")
 
-    # Golay error correction (reuse AWS utils)
+    # 5) Golay error correction (reuse AWS utils from the sample repo)
     error_correcting_code = GolayCode()
     G = error_correcting_code.get_generator_matrix()
     H = error_correcting_code.get_parity_check_matrix()
