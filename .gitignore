@@ -1,0 +1,17 @@
+# Local environment files (DO NOT COMMIT SECRETS)
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environment
+.venv/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
