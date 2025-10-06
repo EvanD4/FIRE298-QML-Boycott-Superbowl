@@ -1,2 +1,2 @@
 # FIRE298-QML-Boycott-Superbowl
-Our goal is to use machine learning to predict the best error correction scheme and optimal parameters for that scheme given the current channel conditions, such as the Quantum Bit Error Rate (QBER).
+Currently we are working on implementing various error correction schemes, including Cascade, LDPC, Turbo Code, and Winnow, in to our BB84 code. We hope to then train an ML model that predicts the best error correction scheme given certain inputs such as Quantum Bit Error Rate (QBER) and key rate.
