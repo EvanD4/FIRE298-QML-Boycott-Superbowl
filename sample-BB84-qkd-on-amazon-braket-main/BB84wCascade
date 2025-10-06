@@ -1,0 +1,164 @@
+import base64
+import argparse
+import numpy as np
+import random
+
+from braket.devices import LocalSimulator
+from utils.bb84 import initialize_protocol, encode_qubits, measure_qubits, filter_qubits, array_to_string
+from utils.secret_utils import convert_to_octets
+
+# ---------------------------------------------------------------------
+# Command line args
+parser = argparse.ArgumentParser(description="BB84 with noise + Cascade error correction")
+parser.add_argument("--num-qubits", type=int, default=24, help="Number of qubits transmitted per BB84 round (default: 24)")
+parser.add_argument("--bit-flip", type=float, default=0.25, dest="bit_flip", help="Bit flip probability in the channel [0,1] (default: 0.25)")
+parser.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducibility")
+args, _ = parser.parse_known_args()
+
+if args.seed is not None:
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+BIT_FLIP_PROBABILITY = args.bit_flip
+NUMBER_OF_QUBITS = max(1, int(args.num_qubits))
+TARGET_KEY_BITS = NUMBER_OF_QUBITS  # target raw key length (before Cascade)
+
+alice_raw_key = np.array([])
+bob_raw_key = np.array([])
+
+# ---------------------------------------------------------------------
+# Utility functions
+def header(title: str):
+    bar = "=" * 80
+    print(f"\n{bar}\n{title}\n{bar}")
+
+def as_int(a):
+    try:
+        return np.asarray(a).astype(int)
+    except Exception:
+        return a
+
+# ---------------------------------------------------------------------
+# Cascade error correction implementation
+def cascade_reconciliation(alice_key, bob_key, rounds=4, seed=None):
+    """
+    Simplified Cascade error reconciliation.
+    alice_key, bob_key: numpy arrays of 0/1 (raw keys)
+    rounds: number of Cascade passes
+    """
+    if seed is not None:
+        random.seed(seed)
+
+    n = len(alice_key)
+    corrected_bob = bob_key.copy()
+
+    # Helper: binary search to locate a single error
+    def binary_search_fix(a, b, start, end):
+        if start == end:
+            b[start] ^= 1  # flip Bob's bit
+            return
+        mid = (start + end) // 2
+        if (a[start:mid+1].sum() % 2) != (b[start:mid+1].sum() % 2):
+            binary_search_fix(a, b, start, mid)
+        else:
+            binary_search_fix(a, b, mid+1, end)
+
+    # Cascade rounds
+    block_size = max(2, n // 4)  # start with ~n/4 blocks
+    for r in range(rounds):
+        # Random permutation
+        perm = np.random.permutation(n)
+        a_perm = alice_key[perm]
+        b_perm = corrected_bob[perm]
+
+        # Partition into blocks
+        for i in range(0, n, block_size):
+            a_block = a_perm[i:i+block_size]
+            b_block = b_perm[i:i+block_size]
+            if len(a_block) == 0:
+                continue
+            # Compare parities
+            if (a_block.sum() % 2) != (b_block.sum() % 2):
+                binary_search_fix(a_perm, b_perm, i, min(i+block_size-1, n-1))
+
+        # Undo permutation
+        corrected_bob = np.zeros_like(b_perm)
+        corrected_bob[perm] = b_perm
+
+        block_size *= 2  # double block size each round
+
+    return corrected_bob
+
+# ---------------------------------------------------------------------
+# CONFIG PRINT
+header("CONFIGURATION")
+print(f"NUMBER_OF_QUBITS (per round): {NUMBER_OF_QUBITS}")
+print(f"BIT_FLIP_PROBABILITY: {BIT_FLIP_PROBABILITY}")
+print(f"TARGET_KEY_BITS: {TARGET_KEY_BITS}")
+if args.seed is not None:
+    print(f"SEED: {args.seed}")
+
+# ---------------------------------------------------------------------
+# Generate key material until TARGET_KEY_BITS of raw key are accumulated
+iteration = 0
+while len(alice_raw_key) < TARGET_KEY_BITS:
+    iteration += 1
+    header(f"BB84 ROUND {iteration}")
+
+    # Alice basis and states
+    encoding_basis_A, states_A, _ = initialize_protocol(NUMBER_OF_QUBITS)
+    sent_bits = array_to_string(states_A)
+    print(f"Alice - encoding_basis: {as_int(encoding_basis_A)}")
+    print(f"Alice - states (sent_bits): {as_int(sent_bits)}")
+
+    # Bob measurement bases
+    _, _, measurement_basis_B = initialize_protocol(NUMBER_OF_QUBITS)
+    print(f"Bob - measurement_basis: {as_int(measurement_basis_B)}")
+
+    # Encode qubits
+    encoded_qubits_A = encode_qubits(NUMBER_OF_QUBITS, states_A, encoding_basis_A)
+
+    # Add bit-flip noise
+    flip_mask = (np.random.rand(NUMBER_OF_QUBITS) < BIT_FLIP_PROBABILITY)
+    print(f"Channel - sampled_flip_mask: {as_int(flip_mask)}")
+    for qi, do_flip in enumerate(flip_mask):
+        if do_flip:
+            encoded_qubits_A.x(qi)
+
+    # Bob measures
+    measured_circuit = measure_qubits(encoded_qubits_A, measurement_basis_B)
+    device = LocalSimulator("braket_sv")
+    result = device.run(measured_circuit, shots=1).result()
+    measured_bits = list(result.measurements[0])
+    print(f"Bob - measured_bits: {as_int(measured_bits)}")
+
+    # Key sifting
+    alice_keep = filter_qubits(sent_bits, encoding_basis_A, measurement_basis_B)
+    bob_keep = filter_qubits(measured_bits, encoding_basis_A, measurement_basis_B)
+    print(f"Sifting - kept_by_Alice: {as_int(alice_keep)}")
+    print(f"Sifting - kept_by_Bob:   {as_int(bob_keep)}")
+
+    alice_raw_key = np.concatenate((alice_raw_key, alice_keep))
+    bob_raw_key = np.concatenate((bob_raw_key, bob_keep))
+    print(f"Accumulated - alice_raw_key_len: {len(alice_raw_key)} | bob_raw_key_len: {len(bob_raw_key)}")
+
+# ---------------------------------------------------------------------
+# Raw keys
+header("RAW KEYS (TRUNCATED TO TARGET)")
+alice_raw_key = alice_raw_key[:TARGET_KEY_BITS].astype(int)
+bob_raw_key = bob_raw_key[:TARGET_KEY_BITS].astype(int)
+print(f"Alice - raw_key[{TARGET_KEY_BITS}]: {as_int(alice_raw_key)}")
+print(f"Bob   - raw_key[{TARGET_KEY_BITS}]: {as_int(bob_raw_key)}")
+
+# ---------------------------------------------------------------------
+# Cascade error correction
+header("CASCADE ERROR CORRECTION")
+bob_corrected_key = cascade_reconciliation(alice_raw_key, bob_raw_key, rounds=4, seed=args.seed)
+
+keys_match = np.array_equal(alice_raw_key, bob_corrected_key)
+print(f"Keys match after Cascade: {keys_match}")
+print(f"Alice final key: {as_int(alice_raw_key)}")
+print(f"Bob final key:   {as_int(bob_corrected_key)}")
+
+ascii_key = base64.b64encode(convert_to_octets(array_to_string(bob_corrected_key))).decode('ascii')
+print(f"Final Base64 shared key: {ascii_key}")
