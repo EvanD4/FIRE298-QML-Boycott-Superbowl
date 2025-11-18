@@ -1,0 +1,31 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Runtime results and logs
+curriculum_results.txt
+quick_results.txt
+*.log
+
+# Temporary test scripts
+run_notebook_demo.py
+run_proper_curriculum.py
+
+# Environment variables (if you have API keys)
+.env
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
